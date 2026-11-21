@@ -66,5 +66,14 @@ async def open_session(login: str) -> Session:
     return session
 
 
+def pep_of(session: Session):
+    """PEP сессии: клиент PDP заводится при первом обращении и дальше тот же."""
+    if session.pep is None:
+        from app.pep import Pep
+
+        session.pep = Pep(session.session_id, session.claims, session.guard_state)
+    return session.pep
+
+
 def get(session_id: str) -> Session | None:
     return SESSIONS.get(session_id)

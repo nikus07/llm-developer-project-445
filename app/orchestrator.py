@@ -45,7 +45,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 
-from app import audit, cards, editor, idempotency, llm, planner, workers
+from app import audit, cards, editor, idempotency, llm, planner, sessions, workers
 from core import config, db
 
 Emit = Callable[[dict], Awaitable[None]]
@@ -76,6 +76,18 @@ ACTION_TITLES = {
 }
 
 
+DENY_TEXTS = {
+    "session_limit": "Лимит смен тарифа за сессию исчерпан (не более двух). Позовите оператора, если смена срочная.",
+    "confirmation_expired": "Время подтверждения истекло — повторите запрос.",
+    "card_not_prepared": "Нечего подтверждать: карточка не готовилась. Повторите запрос.",
+    "pdp_unavailable": "Сервис проверки прав недоступен, поэтому изменения сейчас закрыты. Могу позвать оператора.",
+    "confirmation_missing": "Подтверждение не принято. Повторите запрос.",
+    "confirmation_mismatch": "Подтверждение не относится к этой карточке. Повторите запрос.",
+    "no_write_scope": "У вас нет права менять тариф и услуги.",
+    "role_has_no_write": "Для вашей роли изменения недоступны.",
+}
+
+
 def _live(card) -> bool:
     """Карточка ещё ждёт ответа: TTL и состояние держит база."""
     return db.fetchone(
@@ -93,6 +105,8 @@ def _outcome_text(card, stored: idempotency.StoredResult) -> tuple[str, str]:
         return f"Готово, операция «{title}» выполнена.", outcome
     if outcome == "duplicate":
         return "Эта операция уже исполнена — повтор не выполнялся.", outcome
+    if outcome == "denied":
+        return DENY_TEXTS.get(result.get("reason", ""), "Операция запрещена политикой доступа."), outcome
     if outcome == "daily_limit":
         return (f"Дневной лимит смен тарифа исчерпан ({result.get('limit', 3)}). "
                 "Попробуйте завтра или позовите оператора."), outcome
@@ -112,11 +126,19 @@ async def execute_pending(session, card) -> str:
 
 async def _execute(session, card) -> tuple[str, str]:
     """Исполнение ТОЛЬКО кодом, ключ «{action}:{pending_id}» — одно «да», одна операция."""
-    cards.settle(session, card, "confirmed")
-    session.last_confirmed = card
     key = f"{card.action}:{card.pending_id}"
+    pep = sessions.pep_of(session)
 
     async def call() -> dict:
+        # «да» → PDP: ConfirmCard (та же карточка, TTL), затем Execute (окно + лимит)
+        verdict = await pep.confirm(card)
+        if verdict.allowed:
+            verdict = await pep.execute(card)
+        if not verdict.allowed:
+            cards.settle(session, card, "expired" if verdict.reason == "confirmation_expired" else "denied")
+            return {"outcome": "denied", "error": "denied", "reason": verdict.reason}
+        cards.settle(session, card, "confirmed")
+        session.last_confirmed = card
         try:
             return await session.pool.call("actions", "execute_action", {
                 "action": card.action,
@@ -137,6 +159,10 @@ async def _execute(session, card) -> tuple[str, str]:
     elif outcome == "duplicate":
         _audit(session, card, card.action, "duplicate_suppressed", args=card.details, idempotency_key=key,
                before=result.get("before"), after=result.get("after"))
+    elif outcome == "denied":
+        reason = result.get("reason", "")
+        _audit(session, card, card.action, "expired" if reason == "confirmation_expired" else "denied",
+               args=card.details, idempotency_key=key, detail=reason)
     elif outcome == "daily_limit":
         _audit(session, card, card.action, "server_limit", args=card.details, idempotency_key=key,
                detail=f"daily_limit={result.get('limit')}")
@@ -195,6 +221,10 @@ async def _answer_card(session, message: str, emit: Emit) -> bool:
             await emit({"type": "reply", "text": text, "sources": []})
             return True
         session.last_confirmed = None
+        if verdict == "yes" and len(message.split()) <= 3:  # «да» без карточки — нечего подтверждать
+            await emit({"type": "reply", "sources": [], "text":
+                        "Подтверждать пока нечего: у меня нет карточки действия. Что именно нужно сделать?"})
+            return True
         return False
     if not _live(card):
         cards.settle(session, card, "expired")

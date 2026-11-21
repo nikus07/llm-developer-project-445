@@ -32,6 +32,7 @@ from agents.run_context import RunContextWrapper
 from mcp.shared.exceptions import MCPError
 
 from app import audit, cards, permissions
+from app import sessions
 from app.sessions import Session
 from core import config, db
 
@@ -103,6 +104,13 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
             return json.dumps({"error": "tool_failed", "detail": str(e)[:160]}, ensure_ascii=False)
         if name in PREPARE_TOOLS and isinstance(result, dict) and result.get("ok"):
             card = cards.create(session, result["action"], result["details"], result["view"])
+            verdict = await sessions.pep_of(session).prepare(card)
+            if not verdict.allowed:  # Deny: живой карточки не существует
+                cards.settle(session, card, "denied")
+                _log_tool(session, name, logged_args, f"denied:{verdict.reason}", started)
+                audit.append(session.user.sub, name, "denied", trace_id=session.trace_id or None,
+                             session_id=session.session_id, args=_short(logged_args), detail=verdict.reason)
+                return json.dumps({"error": "denied", "reason": verdict.reason}, ensure_ascii=False)
             _log_tool(session, name, {**logged_args, "pending_id": card.pending_id}, "card_created", started)
             return json.dumps({
                 "card_created": True,
