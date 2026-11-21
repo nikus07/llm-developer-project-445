@@ -45,7 +45,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 
-from app import cards, editor, idempotency, llm, planner, workers
+from app import audit, cards, editor, idempotency, llm, planner, workers
 from core import config, db
 
 Emit = Callable[[dict], Awaitable[None]]
@@ -99,8 +99,19 @@ def _outcome_text(card, stored: idempotency.StoredResult) -> tuple[str, str]:
     return f"Операцию «{title}» выполнить не удалось ({result.get('error') or outcome}). Могу позвать оператора.", outcome
 
 
-async def execute_pending(session, card) -> tuple[str, str]:
-    """«Да»: исполнение ТОЛЬКО кодом, ключ «{action}:{pending_id}» — одно «да», одна операция."""
+def _audit(session, card, what: str, outcome: str, **kw) -> None:
+    audit.append(card.sub, what, outcome, trace_id=session.trace_id or None,
+                 session_id=session.session_id, **kw)
+
+
+async def execute_pending(session, card) -> str:
+    """«Да»: исполнение кодом; возвращает текст ответа абоненту."""
+    text, _ = await _execute(session, card)
+    return text
+
+
+async def _execute(session, card) -> tuple[str, str]:
+    """Исполнение ТОЛЬКО кодом, ключ «{action}:{pending_id}» — одно «да», одна операция."""
     cards.settle(session, card, "confirmed")
     session.last_confirmed = card
     key = f"{card.action}:{card.pending_id}"
@@ -118,11 +129,26 @@ async def execute_pending(session, card) -> tuple[str, str]:
                     "outcome": "error"}
 
     stored = await idempotency.execute(key, card.sub, card.action, call)
-    return _outcome_text(card, stored)
+    text, outcome = _outcome_text(card, stored)
+    result = stored.result
+    if outcome == "executed":
+        _audit(session, card, card.action, "executed", args=card.details, idempotency_key=key,
+               before=result.get("before"), after=result.get("after"))
+    elif outcome == "duplicate":
+        _audit(session, card, card.action, "duplicate_suppressed", args=card.details, idempotency_key=key,
+               before=result.get("before"), after=result.get("after"))
+    elif outcome == "daily_limit":
+        _audit(session, card, card.action, "server_limit", args=card.details, idempotency_key=key,
+               detail=f"daily_limit={result.get('limit')}")
+    else:
+        _audit(session, card, card.action, "error", args=card.details, idempotency_key=key,
+               detail=str(result.get("error") or outcome)[:200])
+    return text, outcome
 
 
 async def reject_pending(session, card) -> str:
     cards.settle(session, card, "rejected")
+    _audit(session, card, card.action, "rejected_by_user", args=card.details)
     return "Хорошо, отменяю. Если понадобится — обращайтесь."
 
 
@@ -133,6 +159,9 @@ async def escalate(session, card=None) -> str:
         "sub": session.user.sub, "subject": "Запрос абонента: связь с оператором",
         "note": "Абонент попросил позвать оператора в чате.",
     })
+    audit.append(session.user.sub, "escalate", "escalated", trace_id=session.trace_id or None,
+                 session_id=session.session_id, args=card.details if card else None,
+                 after={"ticket_id": res.get("ticket_id")})
     return f"Передал ваш запрос оператору, номер обращения {res.get('ticket_id', '—')}. Он свяжется с вами."
 
 
@@ -142,14 +171,15 @@ async def decide(session, pending_id: str, answer: str) -> dict:
     if card is None or card.pending_id != pending_id:
         last = session.last_confirmed
         if answer == "yes" and last is not None and last.pending_id == pending_id:
-            text, outcome = await execute_pending(session, last)  # повтор: идемпотентно
+            text, outcome = await _execute(session, last)  # повтор: идемпотентно
             return {"text": text, "outcome": outcome}
         return {"text": "Эта карточка уже не активна.", "outcome": "no_such_card"}
     if not _live(card):
         cards.settle(session, card, "expired")
+        _audit(session, card, card.action, "expired", args=card.details)
         return {"text": "Время подтверждения истекло — повторите запрос.", "outcome": "expired"}
     if answer == "yes":
-        text, outcome = await execute_pending(session, card)
+        text, outcome = await _execute(session, card)
         return {"text": text, "outcome": outcome}
     return {"text": await reject_pending(session, card), "outcome": "rejected"}
 
@@ -161,19 +191,20 @@ async def _answer_card(session, message: str, emit: Emit) -> bool:
     if card is None:
         last = session.last_confirmed
         if verdict == "yes" and last is not None:  # повторное «да» — идемпотентно
-            text, _ = await execute_pending(session, last)
+            text = await execute_pending(session, last)
             await emit({"type": "reply", "text": text, "sources": []})
             return True
         session.last_confirmed = None
         return False
     if not _live(card):
         cards.settle(session, card, "expired")
+        _audit(session, card, card.action, "expired", args=card.details)
         if verdict == "yes":
             await emit({"type": "reply", "text": "Время подтверждения истекло — повторите запрос.", "sources": []})
             return True
         return False
     if verdict == "yes":
-        text, _ = await execute_pending(session, card)
+        text = await execute_pending(session, card)
     elif verdict == "no":
         text = await reject_pending(session, card)
     elif verdict == "operator":
@@ -200,7 +231,7 @@ async def run_turn(session, message: str, emit: Emit) -> None:
 
     if session.planner is None:
         session.planner = planner.build_planner()
-    plan, history = await planner.next_plan(session.planner, session.thread, message)
+    plan, history = await planner.next_plan(session.planner, session.thread, message, session.trace_id)
     plan, dropped = planner.gate(plan)
     session.thread = history
     for reason in dropped:

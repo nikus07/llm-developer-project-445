@@ -22,7 +22,7 @@ import time
 
 from agents import Agent, AgentOutputSchema, Runner
 
-from core import config
+from core import config, db
 
 
 def build_agent(name: str, instructions: str, tools: list | None = None, output_type=None) -> Agent:
@@ -49,10 +49,25 @@ def collect_tools(result) -> list[dict]:
     return list(calls.values())
 
 
+def _log_llm_call(agent_name: str, trace_id: str, usage, started: float) -> None:
+    db.execute(
+        "insert into llm_calls(trace_id, agent, model, input_tokens, output_tokens, latency_ms)"
+        " values (%s, %s, %s, %s, %s, %s)",
+        (trace_id or None, agent_name, config.MODEL_NAME,
+         getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None),
+         int((time.perf_counter() - started) * 1000)),
+    )
+
+
 async def run_agent(agent: Agent, task, *, trace_id: str = "") -> dict:
-    """Отдельный Runner.run; возвращает доклад, tool-вызовы и время."""
+    """Отдельный Runner.run; возвращает доклад, tool-вызовы и время. Каждый запуск — в llm_calls."""
     started = time.perf_counter()
-    result = await Runner.run(agent, task, max_turns=8)
+    try:
+        result = await Runner.run(agent, task, max_turns=8)
+    except Exception:
+        _log_llm_call(agent.name, trace_id, None, started)  # сбой тоже виден в журнале
+        raise
+    _log_llm_call(agent.name, trace_id, result.context_wrapper.usage, started)
     return {
         "report": str(result.final_output if result.final_output is not None else ""),
         "tools": collect_tools(result),

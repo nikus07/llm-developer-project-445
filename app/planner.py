@@ -107,12 +107,22 @@ def gate(plan: Plan) -> tuple[Plan, list[str]]:
     return Plan(steps=kept, question=plan.question), dropped
 
 
-async def next_plan(planner, history: list, message: str):
+async def next_plan(planner, history: list, message: str, trace_id: str = ""):
     """Один вызов планировщика по истории диалога → (Plan, история хода)."""
+    import time
+
     from agents import Runner
 
+    from app.llm import _log_llm_call
+
     inp = list(history) + [{"role": "user", "content": message}]
-    result = await Runner.run(planner, inp, max_turns=3)
+    started = time.perf_counter()
+    try:
+        result = await Runner.run(planner, inp, max_turns=3)
+    except Exception:
+        _log_llm_call(planner.name, trace_id, None, started)
+        raise
+    _log_llm_call(planner.name, trace_id, result.context_wrapper.usage, started)
     plan = result.final_output
     if not isinstance(plan, Plan):
         plan = Plan.model_validate(plan)

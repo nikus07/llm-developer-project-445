@@ -26,14 +26,15 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 
 from agents import FunctionTool
 from agents.run_context import RunContextWrapper
 from mcp.shared.exceptions import MCPError
 
-from app import cards
+from app import audit, cards
 from app.sessions import Session
-from core import config
+from core import config, db
 
 PREPARE_TOOLS = ("prepare_tariff_change", "prepare_toggle_service", "prepare_contacts_update")
 
@@ -48,18 +49,43 @@ def _model_schema(schema: dict) -> tuple[dict, bool]:
     return schema, has_sub
 
 
+def _short(value, limit: int = 200):
+    """Аргументы в журнал — обрезанные: длинные строки режутся."""
+    if isinstance(value, dict):
+        return {k: _short(v, limit) for k, v in value.items()}
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + "…"
+    return value
+
+
+def _log_tool(session: Session, tool: str, args, outcome: str, started: float) -> None:
+    """Каждый вызов инструмента моделью — в tool_calls (сбой журнала не ломает диалог)."""
+    try:
+        db.execute(
+            "insert into tool_calls(trace_id, tool, args, outcome, latency_ms) values (%s, %s, %s, %s, %s)",
+            (session.trace_id or None, tool,
+             json.dumps(_short(args), ensure_ascii=False, default=str) if args is not None else None,
+             outcome, int((time.perf_counter() - started) * 1000)),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
     """Обёртка одного MCP-инструмента для агента этой сессии."""
     schema, inject_sub = _model_schema(session.pool.tool_schema(name))
 
     async def invoke(ctx: RunContextWrapper, input_json: str) -> str:
+        started = time.perf_counter()
         try:
             args = json.loads(input_json) if input_json and input_json.strip() else {}
         except (TypeError, ValueError):
+            _log_tool(session, name, {"raw": (input_json or "")[:200]}, "bad_arguments", started)
             return json.dumps(
                 {"error": "bad_arguments", "detail": "аргументы — не JSON; повтори вызов по схеме"},
                 ensure_ascii=False,
             )
+        logged_args = dict(args) if isinstance(args, dict) else {"value": args}
         if inject_sub:
             args["sub"] = session.user.sub  # субъект подставляет код, модель его не видит
         session.note(name)
@@ -67,19 +93,27 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
             result = await session.pool.call(session.pool.resource_of(name), name, args)
         except MCPError as e:
             data = e.data if isinstance(e.data, dict) else {}
+            code = str(data.get("error") or getattr(e, "message", "tool_failed"))[:60]
+            _log_tool(session, name, logged_args, f"error:{code}", started)
+            if name in PREPARE_TOOLS:
+                audit.append(session.user.sub, name, "rejected_by_contract", trace_id=session.trace_id or None,
+                             session_id=session.session_id, args=_short(logged_args), detail=code)
             return json.dumps(
                 {"error": getattr(e, "message", "tool_failed")[:60], **data},
                 ensure_ascii=False,
             )
         except Exception as e:  # noqa: BLE001 — сбой сервера становится данными для модели
+            _log_tool(session, name, logged_args, "error:tool_failed", started)
             return json.dumps({"error": "tool_failed", "detail": str(e)[:160]}, ensure_ascii=False)
         if name in PREPARE_TOOLS and isinstance(result, dict) and result.get("ok"):
             card = cards.create(session, result["action"], result["details"], result["view"])
+            _log_tool(session, name, {**logged_args, "pending_id": card.pending_id}, "card_created", started)
             return json.dumps({
                 "card_created": True,
                 "card": card.public_view(config.CARD_TTL_SEC),
                 "next": "карточка готова: перескажи её абоненту и спроси подтверждение «да» или «нет»",
             }, ensure_ascii=False)
+        _log_tool(session, name, logged_args, "ok", started)
         return json.dumps(result, ensure_ascii=False)
 
     return FunctionTool(

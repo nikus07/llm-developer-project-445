@@ -131,10 +131,11 @@ async def execute_action(sub: str, action: str, details_json: str, pending_id: s
                 "before": {"enabled": not enabled}, "after": details}
     if action == "contacts_update":
         body = {k: v for k, v in details.items() if k in ("phone", "email")}
+        old = await _get("/crm/subscriber", sub=sub)
         result = await _post("/crm/contacts", {"sub": sub, **body})
         outcome = "executed" if result.get("outcome") == "updated" else result.get("outcome", "error")
         return {**result, "outcome": outcome, "action": action, "pending_id": pending_id,
-                "after": details}
+                "before": {k: old.get(k) for k in body}, "after": details}
     raise ActionError("unknown_action", f"действие «{action}» неизвестно")
 
 
