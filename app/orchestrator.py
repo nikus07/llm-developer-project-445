@@ -45,7 +45,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable
 
-from app import audit, cards, editor, idempotency, llm, planner, sessions, workers
+from app import audit, cards, editor, guardrail_client, idempotency, llm, planner, sessions, workers
 from core import config, db
 
 Emit = Callable[[dict], Awaitable[None]]
@@ -76,6 +76,11 @@ ACTION_TITLES = {
 }
 
 
+REFUSE_INPUT = ("Извините, я не могу выполнить этот запрос: он нарушает правила безопасности. "
+                "Задайте вопрос о тарифе, списаниях или услугах.")
+REFUSE_OUTPUT = "Не могу показать этот ответ: он не прошёл проверку безопасности. Могу позвать оператора."
+REFUSE_ACTION_DEGRADED = "Сейчас не работает проверка безопасности, поэтому изменения закрыты. Могу позвать оператора."
+
 DENY_TEXTS = {
     "session_limit": "Лимит смен тарифа за сессию исчерпан (не более двух). Позовите оператора, если смена срочная.",
     "confirmation_expired": "Время подтверждения истекло — повторите запрос.",
@@ -84,6 +89,7 @@ DENY_TEXTS = {
     "confirmation_missing": "Подтверждение не принято. Повторите запрос.",
     "confirmation_mismatch": "Подтверждение не относится к этой карточке. Повторите запрос.",
     "no_write_scope": "У вас нет права менять тариф и услуги.",
+    "guard_not_ok": "Сейчас не работает проверка безопасности, поэтому изменения закрыты. Могу позвать оператора.",
     "role_has_no_write": "Для вашей роли изменения недоступны.",
 }
 
@@ -194,12 +200,13 @@ async def escalate(session, card=None) -> str:
 async def decide(session, pending_id: str, answer: str) -> dict:
     """Кнопка карточки: «да» → исполнение, «нет» → отмена."""
     card = cards.active(session)
+    session.guard_state["ok"] = (await guardrail_client.check("подтверждение карточки", "input")).available
     if card is None or card.pending_id != pending_id:
         last = session.last_confirmed
         if answer == "yes" and last is not None and last.pending_id == pending_id:
             text, outcome = await _execute(session, last)  # повтор: идемпотентно
             return {"text": text, "outcome": outcome}
-        return {"text": "Эта карточка уже не активна.", "outcome": "no_such_card"}
+        return {"text": "Карточка не найдена или истекла.", "outcome": "no_such_card"}
     if not _live(card):
         cards.settle(session, card, "expired")
         _audit(session, card, card.action, "expired", args=card.details)
@@ -245,6 +252,24 @@ async def _answer_card(session, message: str, emit: Emit) -> bool:
     return True
 
 
+async def _emit_checked(session, text: str, sources: list[str], card, emit: Emit) -> None:
+    """output-проверка ответа и карточки до показа; unsafe/недоступность — карточка уничтожается."""
+    payload = text + (" " + json.dumps(card.view, ensure_ascii=False) if card is not None else "")
+    verdict = await _guard(session, payload, "output", "chat_output")
+    if verdict.available and not verdict.safe:
+        if card is not None:
+            cards.settle(session, card, "denied")
+        await emit({"type": "reply", "text": REFUSE_OUTPUT, "sources": []})
+        return
+    if not verdict.available and card is not None:  # fail-closed для действий
+        cards.settle(session, card, "denied")
+        await emit({"type": "reply", "text": REFUSE_ACTION_DEGRADED, "sources": []})
+        return
+    if card is not None:
+        await emit({"type": "card", "pending_id": card.pending_id, "card": card.public_view(config.CARD_TTL_SEC)})
+    await emit({"type": "reply", "text": text, "sources": sources})
+
+
 def _strip_fake_sources(text: str, sources: list[str]) -> str:
     """Источник в ответе — только из реальных результатов search_kb."""
     def keep(m: re.Match) -> str:
@@ -253,8 +278,27 @@ def _strip_fake_sources(text: str, sources: list[str]) -> str:
     return re.sub(r"\s*\((?:источник|источники):\s*([^)]*)\)", keep, text).strip()
 
 
+async def _guard(session, text: str, mode: str, what: str):
+    """Проверка текста; недоступный guardrail — деградация: guard_ok=false, чтение идёт."""
+    verdict = await guardrail_client.check(text, mode)
+    session.guard_state["ok"] = verdict.available
+    if not verdict.available:
+        audit.append(session.user.sub, what, "guardrail_degraded", trace_id=session.trace_id or None,
+                     session_id=session.session_id, detail=mode)
+    elif not verdict.safe:
+        audit.append(session.user.sub, what, "guardrail_unsafe", trace_id=session.trace_id or None,
+                     session_id=session.session_id, detail=f"{mode}:{verdict.category}")
+    return verdict
+
+
 async def run_turn(session, message: str, emit: Emit) -> None:
     session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
+
+    # input-проверка реплики — до всего хода (до LLM)
+    verdict = await _guard(session, message, "input", "chat_input")
+    if verdict.available and not verdict.safe:
+        await emit({"type": "reply", "text": REFUSE_INPUT, "sources": []})
+        return
 
     if await _answer_card(session, message, emit):
         return
@@ -281,7 +325,7 @@ async def run_turn(session, message: str, emit: Emit) -> None:
         reply = await llm.run_agent(
             editor.build_editor(session), editor.editor_task(message, []), trace_id=session.trace_id
         )
-        await emit({"type": "reply", "text": reply["report"], "sources": []})
+        await _emit_checked(session, reply["report"], [], None, emit)
         return
 
     card_before = session.pending_card.pending_id if session.pending_card else None
@@ -296,12 +340,10 @@ async def run_turn(session, message: str, emit: Emit) -> None:
         run["agent"] = step.agent
         runs.append(run)
 
-    card = session.pending_card
-    if card is not None and card.pending_id != card_before:
-        await emit({"type": "card", "pending_id": card.pending_id, "card": card.public_view(config.CARD_TTL_SEC)})
-
     final = await llm.run_agent(
         editor.build_editor(session), editor.editor_task(message, runs), trace_id=session.trace_id
     )
     sources = _sources(runs)
-    await emit({"type": "reply", "text": _strip_fake_sources(final["report"], sources), "sources": sources})
+    card = session.pending_card
+    fresh = card if card is not None and card.pending_id != card_before else None
+    await _emit_checked(session, _strip_fake_sources(final["report"], sources), sources, fresh, emit)
