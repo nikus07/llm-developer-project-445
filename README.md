@@ -13,16 +13,33 @@
 
 ## Установка
 
-<!-- Опишите установку: клонирование, зависимости, переменные окружения -->
+Нужны Python 3.12, Docker и OpenAI-совместимая модель (например, LM Studio).
 
 ```bash
 git clone https://github.com/nikus07/llm-developer-project-445.git
 cd llm-developer-project-445
+python3.12 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scriptsctivate
+pip install -r requirements.txt                          # или make install
+cp .env.example .env                                     # заполнить LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
 ```
 
 ## Использование
 
-<!-- Добавьте примеры запуска и запись asciinema — именно это смотрит работодатель -->
+Пять процессов и Postgres (каждый в своём терминале; без `make` — команды из `Makefile`):
+
+```bash
+make infra && make migrate && make seed   # docker compose up -d; python -m core.db migrate; python -m core.seed
+make stand       # :8100  issuer, read-MCP, REST-моки, веб-чат
+make actions     # :8220  action-MCP (JWT)
+make pdp         # :9100  политики Dogwood
+make guardrail   # :8300  guardrail-сервис
+make api         # :8000  оркестратор
+```
+
+Веб-чат: http://127.0.0.1:8100 (anna — смена через карточку, boris — только чтение, olga — оператор).
+Проверки: `make smoke` (54, без модели), `make scenarios` (11 диалогов на живой модели),
+`python scripts/acceptance.py` (чек-лист приёмки), `python scripts/incident.py` (цепочка хода по журналам).
+Отчёт приёмки: [ACCEPTANCE.md](ACCEPTANCE.md).
 
 ---
 
