@@ -24,7 +24,6 @@ TODO(права): два барьера —
 """
 from __future__ import annotations
 
-import copy
 import json
 import time
 
@@ -32,21 +31,11 @@ from agents import FunctionTool
 from agents.run_context import RunContextWrapper
 from mcp.shared.exceptions import MCPError
 
-from app import audit, cards
+from app import audit, cards, permissions
 from app.sessions import Session
 from core import config, db
 
 PREPARE_TOOLS = ("prepare_tariff_change", "prepare_toggle_service", "prepare_contacts_update")
-
-
-def _model_schema(schema: dict) -> tuple[dict, bool]:
-    """Схема для модели: параметра sub в ней нет — его подставляет обёртка."""
-    schema = copy.deepcopy(schema)
-    has_sub = "sub" in (schema.get("properties") or {})
-    if has_sub:
-        schema["properties"].pop("sub")
-        schema["required"] = [r for r in schema.get("required", []) if r != "sub"]
-    return schema, has_sub
 
 
 def _short(value, limit: int = 200):
@@ -73,7 +62,7 @@ def _log_tool(session: Session, tool: str, args, outcome: str, started: float) -
 
 def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
     """Обёртка одного MCP-инструмента для агента этой сессии."""
-    schema, inject_sub = _model_schema(session.pool.tool_schema(name))
+    schema = session.pool.tool_schema(name)
 
     async def invoke(ctx: RunContextWrapper, input_json: str) -> str:
         started = time.perf_counter()
@@ -85,9 +74,16 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
                 {"error": "bad_arguments", "detail": "аргументы — не JSON; повтори вызов по схеме"},
                 ensure_ascii=False,
             )
-        logged_args = dict(args) if isinstance(args, dict) else {"value": args}
-        if inject_sub:
-            args["sub"] = session.user.sub  # субъект подставляет код, модель его не видит
+        if not isinstance(args, dict):
+            args = {}
+        logged_args = dict(args)
+        # барьер 2: допуск в момент вызова, по аргументам, как их прислала модель
+        decision = permissions.admit(session.allowlist, name, args)
+        if not decision.allowed:
+            _log_tool(session, name, logged_args, f"denied:{decision.reason}", started)
+            audit.append(session.user.sub, name, "denied", trace_id=session.trace_id or None,
+                         session_id=session.session_id, args=_short(logged_args), detail=decision.reason)
+            return json.dumps({"error": "denied", "reason": decision.reason}, ensure_ascii=False)
         session.note(name)
         try:
             result = await session.pool.call(session.pool.resource_of(name), name, args)
@@ -127,4 +123,6 @@ def wrap_mcp_tool(session: Session, name: str) -> FunctionTool:
 def wrap_tools(session: Session, names: list[str]) -> list[FunctionTool]:
     """Собрать обёртки для перечня имён (какие имена давать — решает код)."""
     known = set(session.pool.tool_names())
-    return [wrap_mcp_tool(session, n) for n in names if n in known]
+    # барьер 1: модель не видит запрещённого
+    allowed = permissions.visible_tools(session.allowlist, [n for n in names if n in known])
+    return [wrap_mcp_tool(session, n) for n in allowed]

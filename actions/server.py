@@ -2,15 +2,16 @@
 
     uvicorn actions.server:app --host 127.0.0.1 --port 8220
 
-Модели видны prepare_* и create_ticket; execute_action вызывает только код
-оркестратора. sub пока приходит аргументом, подставляет его обёртка
-оркестратора — модель его не видит (на шаге прав аргумент уйдёт).
+Сервер ресурса: каждый вызов несёт Bearer-токен (подпись, издатель, аудитория
+и срок проверяются). Субъект берётся из проверенного токена, аргумента sub
+в контрактах нет — подменять нечего. execute_action вызывает только код
+оркестратора.
 """
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from mcp.server import MCPServer
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.shared.exceptions import MCPError
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -19,13 +20,23 @@ from starlette.routing import Mount, Route
 
 from actions import service as svc
 from actions.contracts import ActionError
+from core.config import RESOURCES
+from core.server_auth import make_mcp_server
 
 ACTION_ERROR_CODE = -32002
 
-actions = MCPServer(
-    name="actions",
+actions = make_mcp_server(
+    "actions",
+    resource=RESOURCES["actions"],
     instructions="Действия абонента: prepare_* готовят карточку, execute_action исполняет после подтверждения.",
 )
+
+
+def _sub() -> str:
+    """Субъект операции — из проверенного токена вызова."""
+    token = get_access_token()
+    assert token is not None, "вызов без аутентифицированного токена"
+    return token.subject
 
 
 def _fail(e: ActionError) -> MCPError:
@@ -33,47 +44,46 @@ def _fail(e: ActionError) -> MCPError:
 
 
 @actions.tool()
-async def prepare_tariff_change(sub: str, tariff: str) -> dict:
+async def prepare_tariff_change(tariff: str) -> dict:
     """Подготовить смену тарифа: проверяет условия и возвращает карточку. Ничего не меняет."""
     try:
-        return await svc.prepare_tariff_change(sub, tariff)
+        return await svc.prepare_tariff_change(_sub(), tariff)
     except ActionError as e:
         raise _fail(e) from None
 
 
 @actions.tool()
-async def prepare_toggle_service(sub: str, service: str, enabled: bool) -> dict:
+async def prepare_toggle_service(service: str, enabled: bool) -> dict:
     """Подготовить включение (enabled=true) или отключение услуги. Ничего не меняет."""
     try:
-        return await svc.prepare_toggle_service(sub, service, enabled)
+        return await svc.prepare_toggle_service(_sub(), service, enabled)
     except ActionError as e:
         raise _fail(e) from None
 
 
 @actions.tool()
-async def prepare_contacts_update(sub: str, phone: str | None = None, email: str | None = None) -> dict:
+async def prepare_contacts_update(phone: str | None = None, email: str | None = None) -> dict:
     """Подготовить смену телефона и/или почты. Ничего не меняет."""
     try:
-        return await svc.prepare_contacts_update(sub, phone, email)
+        return await svc.prepare_contacts_update(_sub(), phone, email)
     except ActionError as e:
         raise _fail(e) from None
 
 
 @actions.tool()
-async def execute_action(sub: str, action: str, details_json: str, pending_id: str,
-                         idempotency_key: str) -> dict:
+async def execute_action(action: str, details_json: str, pending_id: str, idempotency_key: str) -> dict:
     """НЕ ДЛЯ МОДЕЛИ: исполнение подтверждённого действия, вызывает код оркестратора."""
     try:
-        return await svc.execute_action(sub, action, details_json, pending_id, idempotency_key)
+        return await svc.execute_action(_sub(), action, details_json, pending_id, idempotency_key)
     except ActionError as e:
         raise _fail(e) from None
 
 
 @actions.tool()
-async def create_ticket(sub: str, subject: str, note: str = "") -> dict:
+async def create_ticket(subject: str, note: str = "") -> dict:
     """Эскалировать обращение оператору поддержки (тикет, без карточки)."""
     try:
-        return await svc.create_ticket(sub, subject, note)
+        return await svc.create_ticket(_sub(), subject, note)
     except ActionError as e:
         raise _fail(e) from None
 

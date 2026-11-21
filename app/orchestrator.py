@@ -119,7 +119,7 @@ async def _execute(session, card) -> tuple[str, str]:
     async def call() -> dict:
         try:
             return await session.pool.call("actions", "execute_action", {
-                "sub": card.sub, "action": card.action,
+                "action": card.action,
                 "details_json": json.dumps(card.details, ensure_ascii=False),
                 "pending_id": card.pending_id, "idempotency_key": key,
             })
@@ -156,7 +156,7 @@ async def escalate(session, card=None) -> str:
     if card is not None:
         cards.settle(session, card, "rejected")
     res = await session.pool.call("actions", "create_ticket", {
-        "sub": session.user.sub, "subject": "Запрос абонента: связь с оператором",
+        "subject": "Запрос абонента: связь с оператором",
         "note": "Абонент попросил позвать оператора в чате.",
     })
     audit.append(session.user.sub, "escalate", "escalated", trace_id=session.trace_id or None,

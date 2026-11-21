@@ -34,7 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app import orchestrator, sessions
+from app import orchestrator, permissions, sessions
 from core import config
 
 
@@ -77,7 +77,7 @@ async def open_session(body: OpenSession):
         "session_id": session.session_id,
         "name": session.user.name,
         "role": session.user.role,
-        "visible_tools": [t for t in session.pool.tool_names() if t != "execute_action"],
+        "visible_tools": permissions.visible_tools(session.allowlist, session.pool.tool_names()),
     }
 
 
