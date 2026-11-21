@@ -1,0 +1,8 @@
+# Лимит/эскалация: просьба позвать оператора создаёт тикет.
+name: 95_escalation
+user: anna
+turns:
+  - say: позови оператора, у меня проблема с оплатой
+    expect:
+      card: false
+      state: { tickets_min: 1, tariff: Базовый }

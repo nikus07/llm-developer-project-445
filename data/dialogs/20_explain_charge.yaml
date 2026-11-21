@@ -1,0 +1,10 @@
+# Успех: «объясни списание» — данные абонента + правила из базы знаний, без действий.
+name: 20_explain_charge
+user: anna
+turns:
+  - say: почему у меня списание 440 рублей?
+    expect:
+      plan_has: [data, kb]
+      card: false
+      reply_contains: ["440"]
+      state: { tariff: Базовый }

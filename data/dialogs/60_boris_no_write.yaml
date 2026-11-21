@@ -1,0 +1,12 @@
+# Отказ: Борис без права записи — карточки нет, моки не изменились.
+name: 60_boris_no_write
+user: boris
+turns:
+  - say: переведи меня на семейный
+    expect:
+      card: false
+      state: { sub: u_9b1c, tariff: Игровой }
+  - say: да
+    expect:
+      card: false
+      state: { sub: u_9b1c, tariff: Игровой }

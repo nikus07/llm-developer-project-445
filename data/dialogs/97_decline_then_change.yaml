@@ -1,0 +1,20 @@
+# Свой сценарий: отказ от услуги не мешает последующей смене тарифа,
+# а состояние моков отражает ровно то, что подтверждено.
+name: 97_decline_then_change
+user: anna
+turns:
+  - say: отключи Музыку
+    expect:
+      card: true
+  - say: нет
+    expect:
+      card: false
+      state: { service: { name: Музыка, enabled: true }, tariff: Базовый }
+  - say: переведи меня на игровой
+    expect:
+      card: true
+      state: { tariff: Базовый }
+  - say: да
+    expect:
+      reply_contains: ["отово"]
+      state: { tariff: Игровой, service: { name: Музыка, enabled: true } }
