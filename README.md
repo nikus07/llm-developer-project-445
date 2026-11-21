@@ -18,7 +18,7 @@
 ```bash
 git clone https://github.com/nikus07/llm-developer-project-445.git
 cd llm-developer-project-445
-python3.12 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scriptsctivate
+python3.12 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt                          # или make install
 cp .env.example .env                                     # заполнить LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
 ```
