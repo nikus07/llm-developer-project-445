@@ -12,3 +12,35 @@ TODO(контракты): StoredResult(duplicate, result) и execute(key, sub, a
 для услуг и контактов этот слой единственный.
 """
 from __future__ import annotations
+
+import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+from core import db
+
+
+@dataclass
+class StoredResult:
+    duplicate: bool
+    result: dict
+
+
+def _failed(result: dict) -> bool:
+    """Неудача не занимает ключ: сбой не должен запирать повторную попытку."""
+    return "error" in result or result.get("outcome") not in ("executed", "duplicate")
+
+
+async def execute(key: str, sub: str, action: str, fn: Callable[[], Awaitable[dict]]) -> StoredResult:
+    known = db.fetchone("select result from idempotency where key = %s", (key,))
+    if known is not None:
+        return StoredResult(duplicate=True, result=known["result"] or {})
+
+    result = await fn()
+    if not _failed(result):
+        db.execute(
+            "insert into idempotency(key, sub, action, result) values (%s, %s, %s, %s)"
+            " on conflict (key) do nothing",
+            (key, sub, action, json.dumps(result, ensure_ascii=False, default=str)),
+        )
+    return StoredResult(duplicate=result.get("outcome") == "duplicate", result=result)

@@ -41,10 +41,12 @@ TODO(guardrail) — guardrail: input-проверка реплики до все
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 
-from app import editor, llm, planner, workers
+from app import cards, editor, idempotency, llm, planner, workers
+from core import config, db
 
 Emit = Callable[[dict], Awaitable[None]]
 
@@ -67,8 +69,134 @@ def _sources(runs: list[dict]) -> list[str]:
     return found
 
 
+ACTION_TITLES = {
+    "tariff_change": "смена тарифа",
+    "service_toggle": "изменение услуги",
+    "contacts_update": "изменение контактов",
+}
+
+
+def _live(card) -> bool:
+    """Карточка ещё ждёт ответа: TTL и состояние держит база."""
+    return db.fetchone(
+        "select 1 as ok from pending_cards where pending_id = %s and state = 'pending' and expires_at > now()",
+        (card.pending_id,),
+    ) is not None
+
+
+def _outcome_text(card, stored: idempotency.StoredResult) -> tuple[str, str]:
+    """Человекочитаемый ответ по исходу исполнения → (текст, outcome)."""
+    result = stored.result
+    outcome = "duplicate" if stored.duplicate else result.get("outcome", "error")
+    title = ACTION_TITLES.get(card.action, card.action)
+    if outcome == "executed":
+        return f"Готово, операция «{title}» выполнена.", outcome
+    if outcome == "duplicate":
+        return "Эта операция уже исполнена — повтор не выполнялся.", outcome
+    if outcome == "daily_limit":
+        return (f"Дневной лимит смен тарифа исчерпан ({result.get('limit', 3)}). "
+                "Попробуйте завтра или позовите оператора."), outcome
+    return f"Операцию «{title}» выполнить не удалось ({result.get('error') or outcome}). Могу позвать оператора.", outcome
+
+
+async def execute_pending(session, card) -> tuple[str, str]:
+    """«Да»: исполнение ТОЛЬКО кодом, ключ «{action}:{pending_id}» — одно «да», одна операция."""
+    cards.settle(session, card, "confirmed")
+    session.last_confirmed = card
+    key = f"{card.action}:{card.pending_id}"
+
+    async def call() -> dict:
+        try:
+            return await session.pool.call("actions", "execute_action", {
+                "sub": card.sub, "action": card.action,
+                "details_json": json.dumps(card.details, ensure_ascii=False),
+                "pending_id": card.pending_id, "idempotency_key": key,
+            })
+        except Exception as e:  # noqa: BLE001 — сбой исполнения — исход, ключ не занимается
+            data = getattr(e, "data", None)
+            return {"error": (data or {}).get("error", "execute_failed") if isinstance(data, dict) else "execute_failed",
+                    "outcome": "error"}
+
+    stored = await idempotency.execute(key, card.sub, card.action, call)
+    return _outcome_text(card, stored)
+
+
+async def reject_pending(session, card) -> str:
+    cards.settle(session, card, "rejected")
+    return "Хорошо, отменяю. Если понадобится — обращайтесь."
+
+
+async def escalate(session, card=None) -> str:
+    if card is not None:
+        cards.settle(session, card, "rejected")
+    res = await session.pool.call("actions", "create_ticket", {
+        "sub": session.user.sub, "subject": "Запрос абонента: связь с оператором",
+        "note": "Абонент попросил позвать оператора в чате.",
+    })
+    return f"Передал ваш запрос оператору, номер обращения {res.get('ticket_id', '—')}. Он свяжется с вами."
+
+
+async def decide(session, pending_id: str, answer: str) -> dict:
+    """Кнопка карточки: «да» → исполнение, «нет» → отмена."""
+    card = cards.active(session)
+    if card is None or card.pending_id != pending_id:
+        last = session.last_confirmed
+        if answer == "yes" and last is not None and last.pending_id == pending_id:
+            text, outcome = await execute_pending(session, last)  # повтор: идемпотентно
+            return {"text": text, "outcome": outcome}
+        return {"text": "Эта карточка уже не активна.", "outcome": "no_such_card"}
+    if not _live(card):
+        cards.settle(session, card, "expired")
+        return {"text": "Время подтверждения истекло — повторите запрос.", "outcome": "expired"}
+    if answer == "yes":
+        text, outcome = await execute_pending(session, card)
+        return {"text": text, "outcome": outcome}
+    return {"text": await reject_pending(session, card), "outcome": "rejected"}
+
+
+async def _answer_card(session, message: str, emit: Emit) -> bool:
+    """Ход с живой карточкой обслуживает код. True — ход обработан."""
+    card = cards.active(session)
+    verdict = cards.classify_answer(message)
+    if card is None:
+        last = session.last_confirmed
+        if verdict == "yes" and last is not None:  # повторное «да» — идемпотентно
+            text, _ = await execute_pending(session, last)
+            await emit({"type": "reply", "text": text, "sources": []})
+            return True
+        session.last_confirmed = None
+        return False
+    if not _live(card):
+        cards.settle(session, card, "expired")
+        if verdict == "yes":
+            await emit({"type": "reply", "text": "Время подтверждения истекло — повторите запрос.", "sources": []})
+            return True
+        return False
+    if verdict == "yes":
+        text, _ = await execute_pending(session, card)
+    elif verdict == "no":
+        text = await reject_pending(session, card)
+    elif verdict == "operator":
+        text = await escalate(session, card)
+    else:
+        return False  # смена темы: обычный ход, карточка остаётся живой
+    await emit({"type": "reply", "text": text, "sources": []})
+    return True
+
+
+def _strip_fake_sources(text: str, sources: list[str]) -> str:
+    """Источник в ответе — только из реальных результатов search_kb."""
+    def keep(m: re.Match) -> str:
+        names = re.findall(r"[A-Za-z0-9_]+", m.group(1))
+        return m.group(0) if names and all(n in sources for n in names) else ""
+    return re.sub(r"\s*\((?:источник|источники):\s*([^)]*)\)", keep, text).strip()
+
+
 async def run_turn(session, message: str, emit: Emit) -> None:
     session.trace_id = f"tr_{uuid.uuid4().hex[:12]}"
+
+    if await _answer_card(session, message, emit):
+        return
 
     if session.planner is None:
         session.planner = planner.build_planner()
@@ -95,6 +223,7 @@ async def run_turn(session, message: str, emit: Emit) -> None:
         await emit({"type": "reply", "text": reply["report"], "sources": []})
         return
 
+    card_before = session.pending_card.pending_id if session.pending_card else None
     team = workers.build_workers(session, tuple(dict.fromkeys(s.agent for s in plan.steps)))
     runs: list[dict] = []
     for step in plan.steps:
@@ -106,7 +235,12 @@ async def run_turn(session, message: str, emit: Emit) -> None:
         run["agent"] = step.agent
         runs.append(run)
 
+    card = session.pending_card
+    if card is not None and card.pending_id != card_before:
+        await emit({"type": "card", "pending_id": card.pending_id, "card": card.public_view(config.CARD_TTL_SEC)})
+
     final = await llm.run_agent(
         editor.build_editor(session), editor.editor_task(message, runs), trace_id=session.trace_id
     )
-    await emit({"type": "reply", "text": final["report"], "sources": _sources(runs)})
+    sources = _sources(runs)
+    await emit({"type": "reply", "text": _strip_fake_sources(final["report"], sources), "sources": sources})

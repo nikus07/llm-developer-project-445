@@ -52,6 +52,11 @@ class OpenSession(BaseModel):
     user: str
 
 
+class Decision(BaseModel):
+    session_id: str
+    answer: str
+
+
 class ChatRequest(BaseModel):
     session_id: str
     message: str
@@ -72,7 +77,7 @@ async def open_session(body: OpenSession):
         "session_id": session.session_id,
         "name": session.user.name,
         "role": session.user.role,
-        "visible_tools": session.pool.tool_names(),
+        "visible_tools": [t for t in session.pool.tool_names() if t != "execute_action"],
     }
 
 
@@ -111,3 +116,11 @@ async def chat(body: ChatRequest):
             await task
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/api/cards/{pending_id}/decision")
+async def card_decision(pending_id: str, body: Decision):
+    session = sessions.get(body.session_id)
+    if session is None:
+        return JSONResponse({"error": "unknown_session"}, status_code=404)
+    return await orchestrator.decide(session, pending_id, "yes" if body.answer == "yes" else "no")
